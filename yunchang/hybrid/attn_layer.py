@@ -7,7 +7,8 @@ from torch import Tensor
 
 import torch.distributed as dist
 from .utils import RING_IMPL_DICT, RING_IMPL_QKVPACKED_DICT
-from yunchang.globals import PROCESS_GROUP
+from yunchang.globals import PROCESS_GROUP, HAS_SPARSE_SAGE_ATTENTION
+from yunchang.kernels import AttnType
 
 
 class LongContextAttention(torch.nn.Module):
@@ -18,6 +19,7 @@ class LongContextAttention(torch.nn.Module):
         ring_pg (ProcessGroup): ring process group
         scatter_idx (int): scatter_idx for all2all comm
         gather_idx (int): gather_idx for all2all comm
+        use_sync (bool): whether to synchronize after all-to-all
     """
 
     def __init__(
@@ -26,6 +28,9 @@ class LongContextAttention(torch.nn.Module):
         gather_idx: int = 1,
         ring_impl_type: str = "basic",
         use_pack_qkv: bool = False,
+        use_sync: bool = False,
+        attn_type: AttnType = AttnType.FA,
+        attn_processor: torch.nn.Module = None,
     ) -> None:
 
         super(LongContextAttention, self).__init__()
@@ -33,12 +38,21 @@ class LongContextAttention(torch.nn.Module):
         self.ulysses_pg = PROCESS_GROUP.ULYSSES_PG
 
         self.use_pack_qkv = use_pack_qkv
+        self.use_sync = use_sync
+        self.attn_type = attn_type
         assert (
             self.ulysses_pg is not None or self.ring_pg is not None
         ), f"use set_seq_parallel_pg() first. Now ulysses pg {self.ulysses_pg} and ring pg {self.ring_pg}"
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
+        self.attn_processor = attn_processor
         self.ring_attn_fn = RING_IMPL_DICT[ring_impl_type]
+
+        if HAS_SPARSE_SAGE_ATTENTION:
+            from spas_sage_attn.autotune import SparseAttentionMeansim
+            if isinstance(attn_processor, SparseAttentionMeansim) and dist.get_world_size(self.ring_pg) > 1:
+                raise RuntimeError("Sparse Sage attention does not support ring degree > 1.")
+        
 
     def forward(
         self,
@@ -74,7 +88,7 @@ class LongContextAttention(torch.nn.Module):
             qkv = torch.cat([query, key, value]).continous()
             # (3*bs, seq_len, head_cnt/N, head_size)
             qkv = SeqAllToAll4D.apply(
-                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx, use_sync=self.use_sync
             )
             qkv = torch.chunk(qkv, 3, dim=0)
             out = self.ring_attn_fn(
@@ -90,18 +104,20 @@ class LongContextAttention(torch.nn.Module):
                 deterministic=deterministic,
                 return_attn_probs=return_attn_probs,
                 group=self.ring_pg,
+                attn_type=self.attn_type,
+                attn_processor=self.attn_processor,
             )
         else:
             query_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, query, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync
             )
             key_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, key, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync
             )
             value_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, value, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync
             )
-
+            
             out = self.ring_attn_fn(
                 query_layer,
                 key_layer,
@@ -115,6 +131,8 @@ class LongContextAttention(torch.nn.Module):
                 deterministic=deterministic,
                 return_attn_probs=return_attn_probs,
                 group=self.ring_pg,
+                attn_type=self.attn_type,
+                attn_processor=self.attn_processor,
             )
 
         if type(out) == tuple:
@@ -125,7 +143,7 @@ class LongContextAttention(torch.nn.Module):
         # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
         # scatter 1, gather 2
         output = SeqAllToAll4D.apply(
-            self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
+            self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync
         )
 
         # out e.g., [s/p::h]
@@ -140,6 +158,7 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
         ring_pg (ProcessGroup): ring process group
         scatter_idx (int): scatter_idx for all2all comm
         gather_idx (int): gather_idx for all2all comm
+        use_sync (bool): whether to synchronize after all-to-all
     """
 
     def __init__(
@@ -147,6 +166,8 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
         scatter_idx: int = 3,
         gather_idx: int = 1,
         ring_impl_type: str = "basic",
+        use_sync: bool = False,
+        attn_type: AttnType = AttnType.FA,
     ) -> None:
 
         super(LongContextAttentionQKVPacked, self).__init__()
@@ -159,9 +180,10 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
         ), f"use set_seq_parallel_pg() first. Now ulysses pg {self.ulysses_pg} and ring pg {self.ring_pg}"
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
-
+        self.use_sync = use_sync
         self.ring_attn_fn = RING_IMPL_QKVPACKED_DICT[ring_impl_type]
-
+        self.attn_type = attn_type
+        
     def forward(
         self,
         qkv,
@@ -193,7 +215,7 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
 
         if world_size > 1:
             qkv = SeqAllToAll5D.apply(
-                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
+                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx, self.use_sync
             )
 
         out = self.ring_attn_fn(
@@ -207,6 +229,7 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
             deterministic=deterministic,
             return_attn_probs=return_attn_probs,
             group=self.ring_pg,
+            attn_type=self.attn_type,
         )
 
         # print(f"out {out.shape}")
@@ -219,7 +242,7 @@ class LongContextAttentionQKVPacked(torch.nn.Module):
 
         if world_size > 1:
             out = SeqAllToAll4D.apply(
-                self.ulysses_pg, out, self.gather_idx, self.scatter_idx - 1
+                self.ulysses_pg, out, self.gather_idx, self.scatter_idx - 1, self.use_sync
             )
         # out e.g., [s/p::h]
         return out

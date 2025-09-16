@@ -1,37 +1,15 @@
 import torch
 import torch.distributed as dist
 
-from yunchang.globals import HAS_FLASH_ATTN
-
-if HAS_FLASH_ATTN:
-    from flash_attn.flash_attn_interface import (
-        _flash_attn_varlen_forward,
-        _flash_attn_varlen_backward,
-    )
-from .utils import (
-    RingComm,
-    update_out_and_lse,
-)
-
-try:
-    from .triton_utils import (
-        flatten_varlen_lse,
-        unflatten_varlen_lse,
-    )
-except:
-    from .utils import (
-        flatten_varlen_lse,
-        unflatten_varlen_lse,
-    )
+from .utils import RingComm, update_out_and_lse
+from yunchang.kernels import select_flash_attn_impl, AttnType
 
 
-def ring_flash_attn_varlen_forward(
+def ring_flashinfer_attn_forward(
     process_group,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens,
-    max_seqlen,
     softmax_scale,
     dropout_p=0,
     causal=True,
@@ -39,11 +17,14 @@ def ring_flash_attn_varlen_forward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    attn_type: AttnType = AttnType.FLASHINFER,
+    attn_processor=None,
 ):
     comm = RingComm(process_group)
 
     out = None
     lse = None
+
     next_k, next_v = None, None
 
     for step in range(comm.world_size):
@@ -51,27 +32,20 @@ def ring_flash_attn_varlen_forward(
             next_k: torch.Tensor = comm.send_recv(k)
             next_v: torch.Tensor = comm.send_recv(v)
             comm.commit()
+
         if not causal or step <= comm.rank:
-            assert HAS_FLASH_ATTN, "FlashAttention is not available"
-            block_out, _, _, _, _, block_lse, _, _ = _flash_attn_varlen_forward(
+            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+            block_out, block_lse = fn(
                 q,
                 k,
                 v,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
-                dropout_p,
-                softmax_scale,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
                 causal=causal and step == 0,
                 window_size=window_size,
                 softcap=softcap,
                 alibi_slopes=alibi_slopes,
                 return_softmax=True and dropout_p > 0,
-            )
-            block_lse = flatten_varlen_lse(
-                block_lse,
-                cu_seqlens=cu_seqlens,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -81,11 +55,11 @@ def ring_flash_attn_varlen_forward(
             v = next_v
 
     out = out.to(q.dtype)
-    lse = unflatten_varlen_lse(lse, cu_seqlens, max_seqlen)
+    lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
 
 
-def ring_flash_attn_varlen_backward(
+def ring_flashinfer_attn_backward(
     process_group,
     dout,
     q,
@@ -93,8 +67,6 @@ def ring_flash_attn_varlen_backward(
     v,
     out,
     softmax_lse,
-    cu_seqlens,
-    max_seqlen,
     softmax_scale,
     dropout_p=0,
     causal=True,
@@ -102,6 +74,7 @@ def ring_flash_attn_varlen_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    attn_type: AttnType = AttnType.FLASHINFER,
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
@@ -114,6 +87,7 @@ def ring_flash_attn_varlen_backward(
 
     next_dk, next_dv = None, None
     next_k, next_v = None, None
+
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
             next_k = kv_comm.send_recv(k)
@@ -121,8 +95,8 @@ def ring_flash_attn_varlen_backward(
             kv_comm.commit()
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
-            assert HAS_FLASH_ATTN, "FlashAttention is not available"
-            _flash_attn_varlen_backward(
+            fn = select_flash_attn_impl(attn_type, stage="bwd-only")
+            fn(
                 dout,
                 q,
                 k,
@@ -132,10 +106,6 @@ def ring_flash_attn_varlen_backward(
                 block_dq_buffer,
                 block_dk_buffer,
                 block_dv_buffer,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
                 dropout_p,
                 softmax_scale,
                 bwd_causal,
@@ -174,15 +144,17 @@ def ring_flash_attn_varlen_backward(
     return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
-class RingFlashAttnVarlenFunc(torch.autograd.Function):
+WORKSPACE_BUFFER = None
+PREFILL_WRAPPER = None
+
+
+class RingFlashInferAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
         q,
         k,
         v,
-        cu_seqlens,
-        max_seqlen,
         dropout_p,
         softmax_scale,
         causal,
@@ -192,6 +164,8 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        attn_type,
+        attn_processor,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -199,13 +173,11 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
         assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
-        out, softmax_lse = ring_flash_attn_varlen_forward(
+        out, softmax_lse = ring_flashinfer_attn_forward(
             group,
             q,
             k,
             v,
-            cu_seqlens,
-            max_seqlen,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
@@ -213,10 +185,11 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            attn_type=attn_type,
+            attn_processor=attn_processor,
         )
         # this should be out_padded
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens)
-        ctx.max_seqlen = max_seqlen
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -225,12 +198,14 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.attn_type = attn_type
+        ctx.attn_processor = attn_processor
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens = ctx.saved_tensors
-        dq, dk, dv = ring_flash_attn_varlen_backward(
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        dq, dk, dv = ring_flashinfer_attn_backward(
             ctx.group,
             dout,
             q,
@@ -238,8 +213,6 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            cu_seqlens,
-            ctx.max_seqlen,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
@@ -247,30 +220,28 @@ class RingFlashAttnVarlenFunc(torch.autograd.Function):
             softcap=ctx.softcap,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            attn_type=ctx.attn_type,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
-def ring_flash_attn_varlen_qkvpacked_func(
+def ring_flashinfer_attn_qkvpacked_func(
     qkv,
-    cu_seqlens,
-    max_seqlen,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1),
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FLASHINFER,
 ):
-    return RingFlashAttnVarlenFunc.apply(
-        qkv[:, 0],
-        qkv[:, 1],
-        qkv[:, 2],
-        cu_seqlens,
-        max_seqlen,
+    return RingFlashInferAttnFunc.apply(
+        qkv[:, :, 0],
+        qkv[:, :, 1],
+        qkv[:, :, 2],
         dropout_p,
         softmax_scale,
         causal,
@@ -280,30 +251,28 @@ def ring_flash_attn_varlen_qkvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
     )
 
 
-def ring_flash_attn_varlen_kvpacked_func(
+def ring_flashinfer_attn_kvpacked_func(
     q,
     kv,
-    cu_seqlens,
-    max_seqlen,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1),
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FLASHINFER,
 ):
-    return RingFlashAttnVarlenFunc.apply(
+    return RingFlashInferAttnFunc.apply(
         q,
-        kv[:, 0],
-        kv[:, 1],
-        cu_seqlens,
-        max_seqlen,
+        kv[:, :, 0],
+        kv[:, :, 1],
         dropout_p,
         softmax_scale,
         causal,
@@ -313,31 +282,30 @@ def ring_flash_attn_varlen_kvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
     )
 
 
-def ring_flash_attn_varlen_func(
+def ring_flashinfer_attn_func(
     q,
     k,
     v,
-    cu_seqlens,
-    max_seqlen,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1),
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FLASHINFER,
+    attn_processor=None,
 ):
-    return RingFlashAttnVarlenFunc.apply(
+    return RingFlashInferAttnFunc.apply(
         q,
         k,
         v,
-        cu_seqlens,
-        max_seqlen,
         dropout_p,
         softmax_scale,
         causal,
@@ -347,4 +315,6 @@ def ring_flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
+        attn_processor,
     )

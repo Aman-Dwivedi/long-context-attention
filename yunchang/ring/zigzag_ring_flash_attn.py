@@ -1,8 +1,6 @@
 import torch
-import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .utils import RingComm, update_out_and_lse
-
+from yunchang.kernels import AttnType, select_flash_attn_impl
 
 def zigzag_ring_flash_attn_forward(
     process_group,
@@ -16,6 +14,7 @@ def zigzag_ring_flash_attn_forward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    attn_type: AttnType = AttnType.FA,
 ):
     assert causal == True, "zigzag ring is meaningless for causal=False"
     comm = RingComm(process_group)
@@ -28,7 +27,8 @@ def zigzag_ring_flash_attn_forward(
     next_k, next_v = None, None
 
     def forward(q, k, v, causal):
-        block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(
+        fn = select_flash_attn_impl(attn_type, stage="fwd-only")
+        block_out, block_lse = fn(
             q,
             k,
             v,
@@ -91,6 +91,7 @@ def zigzag_ring_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    attn_type: AttnType = AttnType.FA,
 ):
     assert causal == True, "zigzag ring is meaningless for causal=False"
     kv_comm = RingComm(process_group)
@@ -114,7 +115,8 @@ def zigzag_ring_flash_attn_backward(
     def backward(dout, q, k, v, out, softmax_lse, causal):
         seqlen_q = q.shape[1]
         seqlen_kv = k.shape[1]
-        _flash_attn_backward(
+        fn = select_flash_attn_impl(attn_type, stage="bwd-only")
+        fn(
             dout,
             q,
             k,
@@ -197,6 +199,7 @@ class ZigZagRingFlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        attn_type,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -216,6 +219,7 @@ class ZigZagRingFlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            attn_type=attn_type,
         )
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -227,6 +231,7 @@ class ZigZagRingFlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.attn_type = attn_type
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -247,8 +252,9 @@ class ZigZagRingFlashAttnFunc(torch.autograd.Function):
             softcap=ctx.softcap,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            attn_type=ctx.attn_type,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def zigzag_ring_flash_attn_qkvpacked_func(
@@ -262,6 +268,7 @@ def zigzag_ring_flash_attn_qkvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FA,
 ):
     return ZigZagRingFlashAttnFunc.apply(
         qkv[:, :, 0],
@@ -276,6 +283,7 @@ def zigzag_ring_flash_attn_qkvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
     )
 
 
@@ -291,6 +299,7 @@ def zigzag_ring_flash_attn_kvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FA,
 ):
     return ZigZagRingFlashAttnFunc.apply(
         q,
@@ -305,6 +314,7 @@ def zigzag_ring_flash_attn_kvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
     )
 
 
@@ -321,6 +331,8 @@ def zigzag_ring_flash_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    attn_type: AttnType = AttnType.FA,
+    attn_processor=None,
 ):
     return ZigZagRingFlashAttnFunc.apply(
         q,
@@ -335,4 +347,5 @@ def zigzag_ring_flash_attn_func(
         deterministic,
         return_attn_probs,
         group,
+        attn_type,
     )

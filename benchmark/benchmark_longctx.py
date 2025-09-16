@@ -4,6 +4,7 @@ from yunchang import (
     AsyncLongContextAttention,
     LongContextAttention,
     set_seq_parallel_pg,
+    UlyssesAttention,
 )
 from yunchang.comm import EXTRACT_FUNC_DICT
 import torch.cuda
@@ -51,10 +52,24 @@ parser.add_argument(
     help="use torch profiler",
 )
 parser.add_argument(
-    "--use_async_all_to_all",
+    "--use_ulysses",
     action="store_true",
     default=False,
-    help="async allgather",
+    help="use ulysses",
+)
+parser.add_argument(
+    "--attn_type",
+    type=str,
+    default="fa",
+    choices=["fa", "fa3", "torch"],
+    help="attention type",
+)
+# decault causal=True for LLM. no_causal is for DiT.
+parser.add_argument(
+    "--no_causal",
+    action="store_true",
+    default=False,
+    help="use no causal attention",
 )
 
 args = parser.parse_args()
@@ -90,8 +105,8 @@ def get_local_rank():
     local_rank = int(os.getenv('LOCAL_RANK', '0'))
     return local_rank
 
-def benchmark(num_iter=100, forward_only=True, log=True, profile=False):
-    dtype = torch.bfloat16
+def benchmark(num_iter=10, forward_only=True, log=True, profile=False):
+    dtype = torch.float16
     rank = dist.get_rank()
     local_rank = get_local_rank()
     world_size = dist.get_world_size()
@@ -104,8 +119,8 @@ def benchmark(num_iter=100, forward_only=True, log=True, profile=False):
     group_num = args.group_num
     d = args.head_size
 
-    dropout_p = 0
-    causal = True
+    dropout_p = 0.0
+    causal = not args.no_causal
     deterministic = False
 
     assert seqlen % (2 * world_size) == 0, f"seqlen {seqlen} world_size {world_size}"
@@ -145,11 +160,13 @@ def benchmark(num_iter=100, forward_only=True, log=True, profile=False):
         sp_ulysses_degree, sp_ring_degree, rank, world_size, args.use_ulysses_lowdim
     )
 
-    if args.use_async_all_to_all:
-        longctx_attn = AsyncLongContextAttention(ring_impl_type=args.ring_impl_type)
+    from yunchang.kernels import AttnType
+    attn_type = AttnType.from_string(args.attn_type) 
+    if args.use_ulysses:
+        longctx_attn = UlyssesAttention(attn_type=attn_type)
     else:
-        longctx_attn = LongContextAttention(ring_impl_type=args.ring_impl_type)
-
+        longctx_attn = LongContextAttention(ring_impl_type=args.ring_impl_type, attn_type=attn_type)
+        
     out = longctx_attn(
         q,
         k,
@@ -247,11 +264,15 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     if rank == 0:
         color_print(
-            f"# long context attention {args.ring_impl_type}. "
+            f"ring_impl_type: {args.ring_impl_type}. "
+            f"nheads: {args.nheads} head_size: {args.head_size} seq_len: {args.seq_len} "
             f"ulysses_degree : {args.ulysses_degree} fwd_only {forward_only} use_ulysses_lowdim {args.use_ulysses_lowdim}. "
             f"use_qkvpack: {args.use_qkvpack} "
-            f"asyn_all_to_all: {args.use_async_all_to_all}"
+            f"use_ulysses: {args.use_ulysses} "
+            f"causal: {not args.no_causal} "
+            f"attn_type: {args.attn_type} "
         )
     torch.cuda.empty_cache()
     benchmark(forward_only=forward_only, log=False)
     benchmark(forward_only=forward_only, log=True, profile=args.use_profiler)
+    dist.destroy_process_group()
