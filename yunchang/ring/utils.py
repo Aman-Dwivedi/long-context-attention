@@ -2,9 +2,26 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import inspect
 
 __all__ = ["update_out_and_lse", "RingComm"]
 
+def _get_default_args(func):
+    spec = inspect.getfullargspec(func)
+    defaults = spec.defaults if spec.defaults is not None else ()
+    padded_defaults = (None,) * (len(spec.args) - len(defaults)) + defaults
+    args = dict(zip(spec.args, padded_defaults))
+    if "softcap" in args:
+        args["softcap"] = 0.0
+    return args
+
+
+def get_default_args(func):
+    if inspect.isfunction(func):
+        return _get_default_args(func)
+    else:
+        # Use the origin _init_fn in CustomOpDef
+        return _get_default_args(func._init_fn)
 
 @torch.jit.script
 def _update_out_and_lse(
